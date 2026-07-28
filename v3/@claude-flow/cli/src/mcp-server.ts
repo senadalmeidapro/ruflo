@@ -309,6 +309,66 @@ export class MCPServerManager extends EventEmitter {
    * Handles stdin/stdout directly like V2 implementation
    */
   private async startStdioServer(): Promise<void> {
+    // ruflo#1910 — protect the JSON-RPC stdout from any stray
+    // console.log/info/debug emitted by lazily-loaded modules
+    // (@ruvector/router, @claude-flow/neural, transformers.js, ONNX,
+    // semantic-router init, etc.). Codex closes the MCP transport
+    // the moment it sees a non-JSON line on stdout, and one such
+    // line during a tool batch bricked the whole session.
+    //
+    // Strategy: replace console.log/info/debug with stderr writers
+    // for the rest of the process. JSON-RPC frames go out via the
+    // dedicated `writeFrame()` helper below (process.stdout.write
+    // with the original native binding, NOT console.log), so the
+    // hijack can't accidentally redirect protocol frames too.
+    process.env.MCP_STDIO_MODE = '1';
+    const originalLog = console.log;  // eslint-disable-line no-console
+    console.log = (...args: unknown[]) => process.stderr.write('[stdout→stderr] ' + args.map(a => typeof a === 'string' ? a : JSON.stringify(a)).join(' ') + '\n');
+    console.info = (...args: unknown[]) => process.stderr.write('[stdout→stderr] ' + args.map(a => typeof a === 'string' ? a : JSON.stringify(a)).join(' ') + '\n');
+    console.debug = (...args: unknown[]) => process.stderr.write('[stdout→stderr] ' + args.map(a => typeof a === 'string' ? a : JSON.stringify(a)).join(' ') + '\n');
+
+    // #2426 — Force blocking writes on stdout so JSON-RPC frames larger than
+    // the OS pipe buffer (64KB on macOS) are delivered atomically. Without
+    // this, `process.stdout.write()` returns after a partial write when the
+    // pipe buffer is full; the truncated frame is unparseable JSON and the
+    // MCP client (Claude Code) silently drops all 314 tools. The MCP SDK's
+    // StdioServerTransport does the same thing for this reason. `setBlocking`
+    // is an internal Node API but stable since v10 and used in many MCP
+    // implementations; we feature-gate it so we degrade gracefully on
+    // exotic stdout handles (e.g., when not bound to a pipe in tests).
+    const stdoutHandle = (process.stdout as unknown as {
+      _handle?: { setBlocking?: (b: boolean) => void };
+    })._handle;
+    if (stdoutHandle && typeof stdoutHandle.setBlocking === 'function') {
+      stdoutHandle.setBlocking(true);
+    }
+    // Same for stderr — long structured error messages can also exceed the
+    // pipe buffer and tearing those mid-message corrupts the client's log view.
+    const stderrHandle = (process.stderr as unknown as {
+      _handle?: { setBlocking?: (b: boolean) => void };
+    })._handle;
+    if (stderrHandle && typeof stderrHandle.setBlocking === 'function') {
+      stderrHandle.setBlocking(true);
+    }
+
+    /** Send a single JSON-RPC frame to the real stdout. Use this instead
+     * of `console.log` so the hijack above can't redirect protocol frames. */
+    const writeFrame = (msg: unknown): void => {
+      process.stdout.write(JSON.stringify(msg) + '\n');
+    };
+    // Reference originalLog to keep the eslint-disable meaningful — also
+    // gives us an escape hatch if a test wants to verify it was replaced.
+    void originalLog;
+
+    // Catch fatal errors that would otherwise close the transport
+    // mid-batch with no JSON-RPC error returned to the client.
+    process.on('uncaughtException', (err) => {
+      process.stderr.write(`[mcp-stdio] uncaughtException: ${err.stack || err.message}\n`);
+    });
+    process.on('unhandledRejection', (reason) => {
+      process.stderr.write(`[mcp-stdio] unhandledRejection: ${reason instanceof Error ? reason.stack || reason.message : String(reason)}\n`);
+    });
+
     // Import the tool registry
     const { listMCPTools, callMCPTool, hasTool } = await import('./mcp-client.js');
 
@@ -364,7 +424,7 @@ export class MCPServerManager extends EventEmitter {
     }));
 
     // Send server initialization notification
-    console.log(JSON.stringify({
+    writeFrame({
       jsonrpc: '2.0',
       method: 'server.initialized',
       params: {
@@ -377,7 +437,7 @@ export class MCPServerManager extends EventEmitter {
           },
         },
       },
-    }));
+    });
 
     // Handle stdin messages (S-5: bounded buffer to prevent OOM)
     const MAX_BUFFER_SIZE = 10 * 1024 * 1024; // 10MB
@@ -391,10 +451,10 @@ export class MCPServerManager extends EventEmitter {
           `[${new Date().toISOString()}] ERROR [claude-flow-mcp] Buffer exceeded ${MAX_BUFFER_SIZE} bytes, rejecting`
         );
         buffer = '';
-        console.log(JSON.stringify({
+        writeFrame({
           jsonrpc: '2.0',
           error: { code: -32600, message: 'Request too large' },
-        }));
+        });
         return;
       }
 
@@ -408,7 +468,7 @@ export class MCPServerManager extends EventEmitter {
             const message = JSON.parse(line);
             const response = await this.handleMCPMessage(message, sessionId);
             if (response) {
-              console.log(JSON.stringify(response));
+              writeFrame(response);
             }
           } catch (error) {
             console.error(

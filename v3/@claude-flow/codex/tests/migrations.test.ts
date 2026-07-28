@@ -422,7 +422,7 @@ describe('convertSettingsToToml', () => {
       model: 'claude-3-opus',
     };
 
-    const result = convertSettingsToToml(settings);
+    const result = convertSettingsToToml(settings, 'linux');
 
     expect(result).toContain('model = "claude-3-opus"');
   });
@@ -434,7 +434,7 @@ describe('convertSettingsToToml', () => {
       },
     };
 
-    const result = convertSettingsToToml(settings);
+    const result = convertSettingsToToml(settings, 'linux');
 
     expect(result).toContain('approval_policy = "never"');
   });
@@ -478,24 +478,35 @@ describe('convertSettingsToToml', () => {
       },
     };
 
-    const result = convertSettingsToToml(settings);
+    const result = convertSettingsToToml(settings, 'linux');
 
-    expect(result).toContain('[mcp_servers.claude-flow]');
-    expect(result).toContain('command = "npx"');
-    expect(result).toContain('args = ["-y", "@claude-flow/cli"]');
+    expect(result).toContain('[mcp_servers.ruflo]');
+    expect(result).toContain('args = ["-y", "ruflo@latest", "mcp", "start"]');
+    expect(result).toContain('startup_timeout_sec = 120');
     expect(result).toContain('[mcp_servers.custom-server]');
     expect(result).toContain('command = "node"');
   });
 
-  it('should add default claude-flow server when no mcpServers', () => {
+  it('adds Ruflo alongside unrelated custom MCP servers', () => {
+    const result = convertSettingsToToml({
+      mcpServers: { custom: { command: 'node', args: ['server.js'] } },
+    }, 'win32');
+
+    expect(result).toContain('[mcp_servers.custom]');
+    expect(result).toContain('[mcp_servers.ruflo]');
+    expect(result).toContain('command = "cmd"');
+    expect(result).toContain('args = ["/c", "npx", "-y", "ruflo@latest", "mcp", "start"]');
+  });
+
+  it('should add default ruflo server when no mcpServers', () => {
     const settings = {
       model: 'gpt-4',
     };
 
-    const result = convertSettingsToToml(settings);
+    const result = convertSettingsToToml(settings, 'linux');
 
-    // The implementation adds a default claude-flow server when none specified
-    expect(result).toContain('[mcp_servers.claude-flow]');
+    // The implementation adds a default ruflo server when none specified
+    expect(result).toContain('[mcp_servers.ruflo]');
     expect(result).toContain('command = "npx"');
   });
 

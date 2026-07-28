@@ -94,9 +94,12 @@ describe('AgentFederationPlugin', () => {
       expect(context.services.register).toHaveBeenCalled();
     });
 
-    it('should register 7 services in the container', async () => {
+    it('should register 8 services in the container', async () => {
+      // 7 original + federation:transport (ADR-104, registered iff
+      // loadQuicTransport succeeded — succeeds in this env since
+      // agentic-flow's loader has no required peers)
       await plugin.initialize(context as any);
-      expect(context.services.register).toHaveBeenCalledTimes(7);
+      expect(context.services.register).toHaveBeenCalledTimes(8);
     });
 
     it('should register federation:coordinator service', async () => {
@@ -175,9 +178,10 @@ describe('AgentFederationPlugin', () => {
   });
 
   describe('registerMCPTools', () => {
-    it('should return 9 MCP tool definitions', () => {
+    it('should return 16 MCP tool definitions', () => {
+      // 9 original + 3 ADR-097 Phase 4 + 1 ADR-097 Phase 3 upstream + 3 ADR-111 Phase 6
       const tools = plugin.registerMCPTools();
-      expect(tools).toHaveLength(9);
+      expect(tools).toHaveLength(16);
     });
 
     it.each([
@@ -190,6 +194,16 @@ describe('AgentFederationPlugin', () => {
       'federation_trust',
       'federation_audit',
       'federation_consensus',
+      // ADR-097 Phase 4
+      'federation_breaker_status',
+      'federation_evict',
+      'federation_reactivate',
+      // ADR-097 Phase 3 upstream
+      'federation_report_spend',
+      // ADR-111 Phase 6
+      'federation_wg_status',
+      'federation_wg_attest',
+      'federation_wg_keyrotate',
     ] as const)('should include tool "%s"', (expectedName) => {
       const tools = plugin.registerMCPTools();
       const names = tools.map((t) => t.name);
@@ -218,9 +232,9 @@ describe('AgentFederationPlugin', () => {
   });
 
   describe('registerCLICommands', () => {
-    it('should return 10 CLI command definitions', () => {
+    it('should return 11 CLI command definitions', () => {
       const commands = plugin.registerCLICommands();
-      expect(commands).toHaveLength(10);
+      expect(commands).toHaveLength(11);
     });
 
     it.each([
@@ -233,6 +247,7 @@ describe('AgentFederationPlugin', () => {
       'federation status',
       'federation audit',
       'federation trust',
+      'federation trust elevate',
       'federation config',
     ] as const)('should include command "%s"', (expectedName) => {
       const commands = plugin.registerCLICommands();

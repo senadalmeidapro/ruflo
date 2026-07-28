@@ -46,6 +46,12 @@ export interface AgentsMdOptions {
 export interface SkillMdOptions {
   name: string;
   description: string;
+  /** Skill version (default: "1.0.0") */
+  version?: string;
+  /** Skill author (default: "rUv") */
+  author?: string;
+  /** Discovery tags (default: derived from the skill name) */
+  tags?: string[];
   triggers?: string[];
   skipWhen?: string[];
   scripts?: SkillScript[];
@@ -89,6 +95,7 @@ export interface McpServerConfig {
   command: string;
   args?: string[];
   enabled?: boolean;
+  startupTimeout?: number;
   toolTimeout?: number;
   env?: Record<string, string>;
 }
@@ -105,6 +112,7 @@ export interface SkillConfig {
  * Configuration options for config.toml generation
  */
 export interface ConfigTomlOptions {
+  platform?: NodeJS.Platform;
   model?: string;
   approvalPolicy?: ApprovalPolicy;
   sandboxMode?: SandboxMode;

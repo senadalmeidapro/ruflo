@@ -11,11 +11,143 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import { readFileMaybeEncrypted, writeFileRestricted } from '../fs-secure.js';
+import { createRequire } from 'node:module';
+import { readFileMaybeEncrypted, writeFileAtomic, writeFileRestricted } from '../fs-secure.js';
+import { restoreMemoryDbFromBackup } from '../services/memory-backup.js';
+
+/**
+ * #2356 — cached, synchronous capability probe for @ruvector/core. `getHNSWStatus`
+ * is sync and is called by `neural status` in a fresh process that never warms
+ * the lazy HNSW singleton, so reporting availability off the warm singleton
+ * alone produced a false "Not loaded — @ruvector/core not available" even when
+ * the package is installed and exposes VectorDb. Resolving the module (without
+ * importing/initializing it) is a faithful, cheap availability signal.
+ */
+let _ruvectorCoreResolvable: boolean | undefined;
+function isRuvectorCoreResolvable(): boolean {
+  if (_ruvectorCoreResolvable !== undefined) return _ruvectorCoreResolvable;
+  try {
+    const req = createRequire(import.meta.url);
+    req.resolve('@ruvector/core');
+    _ruvectorCoreResolvable = true;
+  } catch {
+    _ruvectorCoreResolvable = false;
+  }
+  return _ruvectorCoreResolvable;
+}
+
+/**
+ * #2735 — before a whole-image sql.js read-modify-persist (export() +
+ * rename over the live database path), refuse if there is evidence of a
+ * live native (better-sqlite3) WAL connection: `-wal`/`-shm` sidecar files
+ * on disk. A native connection in WAL mode keeps its sidecars present for
+ * its entire lifetime (removed only on the last connection's clean close),
+ * so their presence is strong evidence of a live native holder — and their
+ * absence means the image is a clean, checkpointed, standalone file that
+ * sql.js can safely read-modify-write.
+ *
+ * This is a scoped-down version of the fuller "scan live process holders"
+ * design discussed in #2735: it does not close the narrow assess-then-write
+ * race (a native opener could still attach in the gap between this check
+ * and the write), but it directly closes the demonstrated corruption
+ * mechanism — a whole-image write proceeding while an ALREADY-OPEN native
+ * connection's sidecars are on disk — with no platform-specific process
+ * scanning. Fails closed (treats a stat error as "unsafe") because this is
+ * a safety gate, not a best-effort probe.
+ */
+function hasNativeWalSidecars(dbPath: string): boolean {
+  try {
+    return fs.existsSync(`${dbPath}-wal`) || fs.existsSync(`${dbPath}-shm`);
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * #1854: previously every site that needed the memory directory hardcoded
+ * `getMemoryRoot()`, so the documented config entry
+ * points (`memory.persistPath` config field, `memory configure --path`,
+ * `CLAUDE_FLOW_MEMORY_PATH` env var) all silently no-op'd. This helper
+ * is the single source of truth — every `.swarm/memory.db` resolution in
+ * this file flows through it.
+ *
+ * Precedence (highest → lowest):
+ *   1. CLAUDE_FLOW_MEMORY_PATH env var
+ *   2. memory.persistPath / memory.path in claude-flow.config.json (cwd or
+ *      the directory the CLI was invoked from)
+ *   3. Default: cwd/.swarm
+ *
+ * Cached per-process so repeated lookups are cheap; reset only by spawning
+ * a fresh process (which is how config changes already propagate).
+ */
+let _memoryRootCache: string | undefined;
+export function getMemoryRoot(): string {
+  if (_memoryRootCache !== undefined) return _memoryRootCache;
+
+  // 1. Env var
+  const envPath = process.env.CLAUDE_FLOW_MEMORY_PATH;
+  if (envPath && envPath.trim().length > 0) {
+    _memoryRootCache = path.resolve(envPath);
+    return _memoryRootCache;
+  }
+
+  // 2. Config file (claude-flow.config.json)
+  const configCandidates = [
+    path.resolve(process.cwd(), 'claude-flow.config.json'),
+    path.resolve(process.cwd(), '.claude-flow', 'config.json'),
+  ];
+  for (const configPath of configCandidates) {
+    if (!fs.existsSync(configPath)) continue;
+    try {
+      const raw = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+      const fromConfig: unknown = raw?.memory?.persistPath ?? raw?.memory?.path;
+      if (typeof fromConfig === 'string' && fromConfig.trim().length > 0) {
+        _memoryRootCache = path.resolve(fromConfig);
+        return _memoryRootCache;
+      }
+    } catch {
+      /* malformed config — fall through to default */
+    }
+  }
+
+  // 3. Default
+  _memoryRootCache = path.resolve(process.cwd(), '.swarm');
+  return _memoryRootCache;
+}
+
+/** For tests + the `memory configure` flow that mutates the config at runtime. */
+export function _resetMemoryRootCache(): void {
+  _memoryRootCache = undefined;
+}
+
+/**
+ * #2105: Resolve the full path to the SQLite memory database.
+ * Precedence (highest to lowest):
+ *   1. cliFlag             - explicit --path flag passed by a subcommand
+ *   2. CLAUDE_FLOW_DB_PATH - full file-path override (new in #2105)
+ *   3. getMemoryRoot()/memory.db - directory from CLAUDE_FLOW_MEMORY_PATH /
+ *                                  config / default cwd/.swarm
+ */
+export function resolveDbPath(cliFlag?: string): string {
+  if (cliFlag && cliFlag.trim().length > 0) {
+    return path.resolve(cliFlag);
+  }
+  const envDb = process.env.CLAUDE_FLOW_DB_PATH;
+  if (envDb && envDb.trim().length > 0) {
+    return path.resolve(envDb);
+  }
+  return path.join(getMemoryRoot(), 'memory.db');
+}
 
 // ADR-053: Lazy import of AgentDB v3 bridge
 let _bridge: typeof import('./memory-bridge.js') | null | undefined;
 async function getBridge(): Promise<typeof import('./memory-bridge.js') | null> {
+  // #2120 — Allow callers to force the raw sql.js fallback path. The
+  // ensureSchemaColumns backfill (NULL → 'active') lives in that
+  // fallback, so smokes that verify legacy-DB migration semantics need a
+  // way to bypass the bridge. Also useful when the bridge would hang on
+  // network-bound init (Xenova model fetch) in offline CI.
+  if (process.env.CLAUDE_FLOW_DISABLE_BRIDGE === '1') return null;
   if (_bridge === null) return null;
   if (_bridge) return _bridge;
   try {
@@ -312,6 +444,36 @@ CREATE TABLE IF NOT EXISTS vector_indexes (
 );
 
 -- ============================================
+-- GRAPH EDGES (ADR-130 Phase 1)
+-- Unified knowledge graph backend — sql.js canonical store
+-- ============================================
+
+-- Unified graph edges table (ADR-130)
+-- Node IDs use domain-prefixed format: {domain}:{uuid}
+-- where domain in (mem, agent, task, entity, span, pattern)
+CREATE TABLE IF NOT EXISTS graph_edges (
+  id              TEXT PRIMARY KEY,          -- edge-{uuid}
+  source_id       TEXT NOT NULL,             -- domain-prefixed node ID
+  target_id       TEXT NOT NULL,             -- domain-prefixed node ID
+  relation        TEXT NOT NULL,             -- e.g. "caused", "depends-on", "imports"
+  weight          REAL DEFAULT 1.0,
+  -- Temporal / reliability semantics (ADR-130 §"graph that forgets" property)
+  confidence      REAL DEFAULT 1.0,          -- [0,1]; updated by JUDGE step
+  decay_rate      REAL DEFAULT 0.0,          -- per-day exponential decay applied at read time
+  last_reinforced TEXT,                      -- ISO-8601; set when CONSOLIDATE re-touches edge
+  witness_id      TEXT,                      -- FK to verification/witness-fixes.json (ADR-103)
+  -- Embedding storage: "inline:{base64}" | "vector_indexes:{id}" | NULL
+  embedding_ref   TEXT,
+  metadata        TEXT,                      -- JSON blob for plugin-specific fields
+  created_at      TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_graph_edges_source    ON graph_edges (source_id);
+CREATE INDEX IF NOT EXISTS idx_graph_edges_target    ON graph_edges (target_id);
+CREATE INDEX IF NOT EXISTS idx_graph_edges_relation  ON graph_edges (relation);
+CREATE INDEX IF NOT EXISTS idx_graph_edges_reinforced ON graph_edges (last_reinforced);
+
+-- ============================================
 -- SYSTEM METADATA
 -- ============================================
 
@@ -390,7 +552,7 @@ export async function getHNSWIndex(options?: {
     const { VectorDb } = ruvectorCore;
 
     // Persistent storage paths — resolve to absolute to survive CWD changes
-    const swarmDir = path.resolve(process.cwd(), '.swarm');
+    const swarmDir = getMemoryRoot();
     if (!fs.existsSync(swarmDir)) {
       fs.mkdirSync(swarmDir, { recursive: true });
     }
@@ -499,7 +661,7 @@ function saveHNSWMetadata(): void {
   if (!hnswIndex?.entries) return;
 
   try {
-    const swarmDir = path.join(process.cwd(), '.swarm');
+    const swarmDir = getMemoryRoot();
     const metadataPath = path.join(swarmDir, 'hnsw.metadata.json');
     const metadata = Array.from(hnswIndex.entries.entries());
     fs.writeFileSync(metadataPath, JSON.stringify(metadata));
@@ -625,8 +787,13 @@ export function getHNSWStatus(): {
     };
   }
 
+  // #2356: `available` now reflects real capability (index already loaded OR
+  // @ruvector/core installed and resolvable), not merely whether the lazy
+  // singleton happens to be warm in this process. `initialized` still reports
+  // whether the in-process index is actually loaded, so callers can tell
+  // "installed but not yet loaded" apart from "loaded".
   return {
-    available: hnswIndex !== null,
+    available: hnswIndex !== null || isRuvectorCoreResolvable(),
     initialized: hnswIndex?.initialized ?? false,
     entryCount: hnswIndex?.entries.size ?? 0,
     dimensions: hnswIndex?.dimensions ?? 384
@@ -928,10 +1095,13 @@ INSERT OR REPLACE INTO metadata (key, value) VALUES
   ('temporal_decay', 'enabled'),
   ('hnsw_indexing', 'enabled');
 
--- Create default vector index configuration
+-- Create default vector index configuration. Dimension matches the default
+-- ONNX embedding model (Xenova/all-MiniLM-L6-v2, 384-dim); HNSW rejects
+-- inserts whose dim does not match this row, so a 768 here breaks every
+-- memory_store --vector and memory_search on a fresh install (#1947).
 INSERT OR IGNORE INTO vector_indexes (id, name, dimensions) VALUES
-  ('default', 'default', 768),
-  ('patterns', 'patterns', 768);
+  ('default', 'default', 384),
+  ('patterns', 'patterns', 384);
 `;
 }
 
@@ -940,6 +1110,11 @@ INSERT OR IGNORE INTO vector_indexes (id, name, dimensions) VALUES
  */
 export interface MemoryInitResult {
   success: boolean;
+  /**
+   * #1791.6 — set when an existing database was found and `force` was not
+   * passed. The call is treated as a successful no-op rather than an error.
+   */
+  alreadyExists?: boolean;
   backend: string;
   dbPath: string;
   schemaVersion: string;
@@ -1016,6 +1191,23 @@ export async function ensureSchemaColumns(dbPath: string): Promise<{
         } catch (e) {
           // Column might already exist or other error - continue
         }
+      }
+    }
+
+    // #2120 — Belt-and-suspenders backfill. `ALTER TABLE ADD COLUMN
+    // status TEXT DEFAULT 'active'` should populate existing rows with
+    // 'active' in modern SQLite, but: (a) some auto-memory bridge writes
+    // happen via INSERT paths that pass an explicit NULL, (b) some
+    // historical sql.js builds skipped the DEFAULT backfill, (c)
+    // entries can be migrated in from older snapshots. After ensuring
+    // the column exists, force-backfill any remaining NULL → 'active'.
+    // Safe on already-correct DBs (0 rows updated).
+    if (columnsAdded.includes('status') || existingColumns.has('status')) {
+      try {
+        db.run(`UPDATE memory_entries SET status = 'active' WHERE status IS NULL`);
+        modified = true;
+      } catch {
+        /* table is read-only or doesn't exist — skip */
       }
     }
 
@@ -1150,6 +1342,326 @@ async function activateControllerRegistry(
 }
 
 /**
+ * Self-heal an EXISTING memory database that is missing the `vector_indexes`
+ * table or per-namespace rows.
+ *
+ * Why this exists: fresh installs create `vector_indexes` + seed rows, but a
+ * DB written by an older CLI or by agentdb directly may have thousands of
+ * embedded rows in `memory_entries` and NO `vector_indexes` table at all.
+ * Two things break as a result:
+ *   1. The statusline's vector count read collapsed to `0` (the count query
+ *      referenced the missing table and failed whole — now split, but the
+ *      HNSW flag still needs the table).
+ *   2. #1941 — `memory_search` routes per namespace via `vector_indexes`; a
+ *      namespace with no row returns 0 results even when entries exist.
+ *
+ * This is idempotent and conservative:
+ *   - Does NOTHING (no writes) when the table already exists and every embedded
+ *     namespace already has a row — the common already-healed path, hit on
+ *     every MCP start, must not write to the live DB unnecessarily.
+ *   - Before ANY write, runs `PRAGMA quick_check`; if the DB reports structural
+ *     corruption it SKIPS the repair entirely (returns `corrupt:true`) rather
+ *     than writing into a malformed btree and risking making it worse. The
+ *     caller/user should recover via `sqlite3 old.db .recover | sqlite3 new.db`.
+ *   - Does NOT checkpoint. mode=ro readers already see committed WAL frames, and
+ *     forcing a checkpoint on a DB with a torn WAL could persist latent damage.
+ *
+ * When a repair IS needed and the DB is healthy: creates the table if absent,
+ * seeds the fresh-install default rows, and backfills an accurate
+ * `total_vectors` per namespace. Runs on the existing-DB path of
+ * `initializeMemoryDatabase` (MCP start / `memory init`) and from `ruflo init`.
+ *
+ * Uses better-sqlite3 (WAL-safe, native). If the native module is unavailable
+ * it is a silent no-op — the split statusline query already prevents the count
+ * from zeroing; only the HNSW flag and namespace routing stay degraded.
+ */
+/**
+ * Auto-recover a structurally-corrupt memory DB into a clean one, universally
+ * (better-sqlite3 only — no dependency on the external `sqlite3` CLI, which is
+ * absent on many npx hosts). Safe by construction:
+ *   1. Confirms corruption (quick_check) — no-op on a healthy DB.
+ *   2. Acquires an EXCLUSIVE lock (BEGIN IMMEDIATE). If another process is
+ *      writing, it SKIPS (returns reason:'writer-active') rather than racing a
+ *      writer and losing its in-flight writes — the mistake that must not recur.
+ *   3. Rebuilds a fresh DB table-by-table (schema + rows), skipping any single
+ *      table whose pages won't scan so one bad table can't abort the whole
+ *      rebuild.
+ *   4. VERIFIES the rebuild (integrity_check == ok AND recovered
+ *      memory_entries count >= the readable source count) BEFORE touching the
+ *      original.
+ *   5. Backs up the corrupt DB to `<db>.corrupt-<ts>.bak`, then atomically
+ *      renames the verified rebuild into place and drops stale -wal/-shm.
+ * On any failure the original + backup are left intact — never destructive.
+ */
+export async function recoverMemoryDatabase(
+  dbPath: string,
+  opts: { verbose?: boolean } = {},
+): Promise<{ recovered: boolean; backupPath?: string; rows?: number; reason?: string; restoredFromBackup?: boolean; from?: string; restoreReason?: string }> {
+  if (!dbPath || !fs.existsSync(dbPath)) return { recovered: false, reason: 'no-db' };
+
+  // Fallback for when the in-place rebuild can't produce a verified DB (issue
+  // #2584): rebuild-from-corrupt salvages nothing when the damage is total, so
+  // restore the newest integrity-ok backup instead of leaving the store dead.
+  const restoreFromBackup = async (reason: string) => {
+    const r = await restoreMemoryDbFromBackup(dbPath, { verbose: opts.verbose });
+    if (r.restored) {
+      return { recovered: true, restoredFromBackup: true, backupPath: r.corruptBackupPath, rows: r.rows, from: r.from };
+    }
+    return { recovered: false, reason, restoreReason: r.skipped };
+  };
+
+  let Database: any;
+  try {
+    // Module name behind a variable so TS does not statically resolve the
+    // optional native dep's types at build time (CI may not install them).
+    const mod: string = 'better-sqlite3';
+    Database = (await import(mod)).default;
+  } catch {
+    return await restoreFromBackup('no-native');
+  }
+
+  const ts = Date.now();
+  const tmpPath = `${dbPath}.recovering-${ts}`;
+  const bakPath = `${dbPath}.corrupt-${ts}.bak`;
+  let src: any;
+  let dst: any;
+
+  try {
+    src = new Database(dbPath, { timeout: 1500 });
+
+    // Confirm corruption — never rewrite a healthy DB.
+    const qc = src.prepare('PRAGMA quick_check(1)').get() as Record<string, string> | undefined;
+    const qcVal = qc ? String(Object.values(qc)[0] ?? '') : '';
+    if (qcVal.toLowerCase() === 'ok') { src.close(); return { recovered: false, reason: 'not-corrupt' }; }
+
+    // Exclusive-writer guard: acquire the write lock. If busy, another process
+    // is writing — do NOT race it. Reading within this txn is still allowed.
+    try {
+      src.exec('BEGIN IMMEDIATE');
+    } catch {
+      src.close();
+      return { recovered: false, reason: 'writer-active' };
+    }
+
+    let srcRows = 0;
+    try { srcRows = (src.prepare('SELECT COUNT(*) AS c FROM memory_entries').get() as { c: number })?.c ?? 0; } catch { /* unreadable */ }
+
+    try { fs.rmSync(tmpPath, { force: true }); } catch { /* fresh */ }
+    dst = new Database(tmpPath);
+
+    // Copy schema: tables first (so data can be inserted), then indexes/triggers.
+    const objects = src
+      .prepare("SELECT type, name, sql FROM sqlite_master WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%'")
+      .all() as Array<{ type: string; name: string; sql: string }>;
+    const tables = objects.filter(o => o.type === 'table');
+    const others = objects.filter(o => o.type !== 'table');
+
+    for (const t of tables) {
+      try { dst.exec(t.sql); } catch { /* skip an untranslatable table def */ }
+    }
+
+    // Copy rows table-by-table; a table whose pages won't scan is skipped whole.
+    let copiedEntries = 0;
+    for (const t of tables) {
+      try {
+        const cols = (dst.prepare(`PRAGMA table_info("${t.name}")`).all() as Array<{ name: string }>).map(c => c.name);
+        if (!cols.length) continue;
+        const colList = cols.map(c => `"${c}"`).join(',');
+        const placeholders = cols.map(() => '?').join(',');
+        const insert = dst.prepare(`INSERT OR IGNORE INTO "${t.name}" (${colList}) VALUES (${placeholders})`);
+        const rows = src.prepare(`SELECT ${colList} FROM "${t.name}"`).all() as Array<Record<string, unknown>>;
+        const runAll = dst.transaction((rs: Array<Record<string, unknown>>) => {
+          for (const r of rs) insert.run(cols.map(c => r[c] as any));
+        });
+        runAll(rows);
+        if (t.name === 'memory_entries') copiedEntries = rows.length;
+      } catch { /* skip a table whose data pages are unreadable */ }
+    }
+
+    for (const o of others) {
+      try { dst.exec(o.sql); } catch { /* an index over corrupt data — non-fatal */ }
+    }
+
+    dst.close(); dst = null;
+    try { src.exec('ROLLBACK'); } catch { /* ignore */ }
+    src.close(); src = null;
+
+    // Verify BEFORE touching the original.
+    const check = new Database(tmpPath, { readonly: true });
+    const integ = String(check.pragma('integrity_check', { simple: true }) ?? '');
+    let dstRows = 0;
+    try { dstRows = (check.prepare('SELECT COUNT(*) AS c FROM memory_entries').get() as { c: number })?.c ?? 0; } catch { /* */ }
+    check.close();
+
+    if (integ.toLowerCase() !== 'ok' || dstRows < srcRows) {
+      try { fs.rmSync(tmpPath, { force: true }); } catch { /* */ }
+      if (opts.verbose) {
+        console.log(`memory DB rebuild-in-place failed (integrity=${integ}, rows ${dstRows}/${srcRows}) — trying newest good backup`);
+      }
+      return await restoreFromBackup('verify-failed');
+    }
+
+    // Back up the corrupt DB, then atomically swap in the verified rebuild.
+    fs.copyFileSync(dbPath, bakPath);
+    fs.renameSync(tmpPath, dbPath);
+    for (const s of ['-wal', '-shm']) { try { fs.rmSync(`${dbPath}${s}`, { force: true }); } catch { /* */ } }
+
+    if (opts.verbose) {
+      console.log(`memory DB auto-recovered: ${dstRows} rows, integrity ok. Corrupt original saved to ${bakPath}`);
+    }
+    return { recovered: true, backupPath: bakPath, rows: dstRows };
+  } catch (e) {
+    try { dst?.close(); } catch { /* */ }
+    try { src?.exec('ROLLBACK'); } catch { /* */ }
+    try { src?.close(); } catch { /* */ }
+    try { fs.rmSync(tmpPath, { force: true }); } catch { /* */ }
+    if (opts.verbose) console.log(`memory DB rebuild-in-place error (${(e as Error)?.message ?? e}) — trying newest good backup`);
+    return await restoreFromBackup('error');
+  }
+}
+
+export async function repairVectorIndexes(
+  dbPath: string,
+  opts: { verbose?: boolean; autoRecover?: boolean } = {},
+): Promise<{ repaired: boolean; tableCreated: boolean; namespaces: string[]; corrupt?: boolean; recovered?: boolean; backupPath?: string }> {
+  const res = { repaired: false, tableCreated: false, namespaces: [] as string[], corrupt: false };
+  if (!dbPath || !fs.existsSync(dbPath)) return res;
+
+  let Database: any;
+  try {
+    // Module name behind a variable so TS does not statically resolve the
+    // optional native dep's types at build time (CI may not install them).
+    const mod: string = 'better-sqlite3';
+    Database = (await import(mod)).default;
+  } catch {
+    // Native module absent (e.g. WASM-only host). Statusline fix still covers
+    // the display; nothing to repair here.
+    return res;
+  }
+
+  let db: any;
+  try {
+    db = new Database(dbPath, { timeout: 3000 });
+
+    const tableExists = (name: string): boolean =>
+      (db.prepare("SELECT COUNT(*) AS c FROM sqlite_master WHERE type='table' AND name=?").get(name)?.c ?? 0) > 0;
+
+    // Nothing to key off if there is no entries table.
+    if (!tableExists('memory_entries')) { db.close(); return res; }
+
+    const hasVectorIndexes = tableExists('vector_indexes');
+
+    // Namespaces that actually have embeddings.
+    const nsRows = db
+      .prepare(
+        "SELECT COALESCE(namespace, 'default') AS ns, COUNT(*) AS c " +
+        'FROM memory_entries WHERE embedding IS NOT NULL GROUP BY ns',
+      )
+      .all() as Array<{ ns: string; c: number }>;
+
+    // Which of those are already present in vector_indexes? If the table exists
+    // and every embedded namespace already has a row, the DB is already healed
+    // — return WITHOUT writing anything (common path on every MCP start).
+    let needsWrite = !hasVectorIndexes;
+    if (hasVectorIndexes) {
+      const present = new Set(
+        (db.prepare('SELECT name FROM vector_indexes').all() as Array<{ name: string }>).map(r => r.name),
+      );
+      needsWrite = nsRows.some(r => !present.has(String(r.ns || 'default')));
+    }
+    if (!needsWrite) { db.close(); return res; }
+
+    // A write is needed. GUARD: never write into a structurally corrupt DB —
+    // that risks worsening the damage. quick_check is cheaper than a full
+    // integrity_check and only runs on the rare repair path, not every start.
+    const qc = db.prepare('PRAGMA quick_check(1)').get() as Record<string, string> | undefined;
+    const qcVal = qc ? String(Object.values(qc)[0] ?? '') : '';
+    if (qcVal.toLowerCase() !== 'ok') {
+      res.corrupt = true;
+      db.close(); // release our handle before recovery may swap the file
+      if (opts.autoRecover) {
+        // Auto-fix: rebuild the corrupt DB (backup + verify + atomic swap), then
+        // provision vector_indexes on the clean rebuild. This is what makes any
+        // npx-deployed ruflo self-repair a corrupt memory DB on init / MCP start.
+        const rec = await recoverMemoryDatabase(dbPath, { verbose: opts.verbose });
+        if (rec.recovered) {
+          const healed = await repairVectorIndexes(dbPath, { verbose: opts.verbose });
+          return { ...healed, corrupt: true, recovered: true, backupPath: rec.backupPath };
+        }
+        if (opts.verbose) {
+          console.log(`vector_indexes repair skipped — corruption (${qcVal}); auto-recovery not run (${rec.reason ?? 'unknown'})`);
+        }
+      } else if (opts.verbose) {
+        console.log(
+          'vector_indexes repair SKIPPED — memory DB reports corruption (' + qcVal + '). ' +
+          'Recover with:  sqlite3 <db> .recover | sqlite3 <db>.recovered',
+        );
+      }
+      return res;
+    }
+
+    if (!hasVectorIndexes) {
+      db.exec(`CREATE TABLE IF NOT EXISTS vector_indexes (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL UNIQUE,
+        dimensions INTEGER NOT NULL,
+        metric TEXT DEFAULT 'cosine' CHECK(metric IN ('cosine', 'euclidean', 'dot')),
+        hnsw_m INTEGER DEFAULT 16,
+        hnsw_ef_construction INTEGER DEFAULT 200,
+        hnsw_ef_search INTEGER DEFAULT 100,
+        quantization_type TEXT CHECK(quantization_type IN ('none', 'scalar', 'product')),
+        quantization_bits INTEGER DEFAULT 8,
+        total_vectors INTEGER DEFAULT 0,
+        last_rebuild_at INTEGER,
+        created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now') * 1000),
+        updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now') * 1000)
+      )`);
+      res.tableCreated = true;
+    }
+
+    // 384 = default ONNX model dim (Xenova/all-MiniLM-L6-v2); HNSW rejects
+    // dim-mismatched inserts, so this must match the stored embeddings (#1947).
+    const ensureRow = db.prepare(
+      'INSERT OR IGNORE INTO vector_indexes (id, name, dimensions) VALUES (?, ?, 384)',
+    );
+    const setCount = db.prepare(
+      'UPDATE vector_indexes SET total_vectors = ?, updated_at = ? WHERE name = ?',
+    );
+
+    const backfill = db.transaction(() => {
+      // Parity with a fresh install's seed rows.
+      ensureRow.run('default', 'default');
+      ensureRow.run('patterns', 'patterns');
+
+      const now = Date.now();
+      for (const r of nsRows) {
+        const ns = String(r.ns || 'default');
+        ensureRow.run(ns, ns);
+        setCount.run(r.c, now, ns);
+        res.namespaces.push(ns);
+      }
+    });
+    backfill();
+
+    res.repaired = res.tableCreated || res.namespaces.length > 0;
+    db.close();
+
+    if (opts.verbose && res.repaired) {
+      console.log(
+        `vector_indexes ${res.tableCreated ? 'created' : 'refreshed'} — ` +
+        `backfilled ${res.namespaces.length} namespace(s)`,
+      );
+    }
+  } catch (e) {
+    try { db?.close(); } catch { /* already closed */ }
+    if (opts.verbose) {
+      console.log(`vector_indexes repair skipped: ${(e as Error)?.message ?? e}`);
+    }
+  }
+  return res;
+}
+
+/**
  * Initialize the memory database properly using sql.js
  */
 export async function initializeMemoryDatabase(options: {
@@ -1167,7 +1679,7 @@ export async function initializeMemoryDatabase(options: {
     migrate = true
   } = options;
 
-  const swarmDir = path.join(process.cwd(), '.swarm');
+  const swarmDir = getMemoryRoot();
   const dbPath = customPath || path.join(swarmDir, 'memory.db');
   const dbDir = path.dirname(dbPath);
 
@@ -1186,22 +1698,33 @@ export async function initializeMemoryDatabase(options: {
     }
 
     // Check existing database
+    // #1791.6 — Idempotent re-init: if the database already exists and the
+    // caller did not pass --force, treat it as a successful no-op instead of
+    // an error. Callers (CLI, MCP tools, embeddings) can branch on
+    // `alreadyExists` if they want a different message; previous behavior
+    // surfaced an `[ERROR]` and a "Initialization failed" spinner even when
+    // the existing DB was perfectly healthy.
     if (fs.existsSync(dbPath) && !force) {
+      // #2568-followup: an existing DB may predate `vector_indexes` (or was
+      // written by agentdb directly). Self-heal it here — this branch is hit on
+      // every MCP-server start and `memory init`, so any ruflo repairs itself.
+      // Idempotent + best-effort; never turns a healthy re-init into a failure.
+      const heal = await repairVectorIndexes(dbPath, { verbose, autoRecover: true });
       return {
-        success: false,
+        success: true,
+        alreadyExists: true,
         backend,
         dbPath,
         schemaVersion: '3.0.0',
-        tablesCreated: [],
+        tablesCreated: heal.tableCreated ? ['vector_indexes'] : [],
         indexesCreated: [],
         features: {
           vectorEmbeddings: false,
           patternLearning: false,
           temporalDecay: false,
-          hnswIndexing: false,
+          hnswIndexing: heal.repaired,
           migrationTracking: false
-        },
-        error: 'Database already exists. Use --force to reinitialize.'
+        }
       };
     }
 
@@ -1375,7 +1898,7 @@ export async function checkMemoryInitialization(dbPath?: string): Promise<{
   };
   tables?: string[];
 }> {
-  const swarmDir = path.join(process.cwd(), '.swarm');
+  const swarmDir = getMemoryRoot();
   const path_ = dbPath || path.join(swarmDir, 'memory.db');
 
   if (!fs.existsSync(path_)) {
@@ -1435,7 +1958,7 @@ export async function applyTemporalDecay(dbPath?: string): Promise<{
   patternsDecayed: number;
   error?: string;
 }> {
-  const swarmDir = path.join(process.cwd(), '.swarm');
+  const swarmDir = getMemoryRoot();
   const path_ = dbPath || path.join(swarmDir, 'memory.db');
 
   try {
@@ -1461,9 +1984,9 @@ export async function applyTemporalDecay(dbPath?: string): Promise<{
 
     const changes = db.getRowsModified();
 
-    // Save
+    // Save (atomic — issue #2584: a torn full-image flush corrupts the store)
     const data = db.export();
-    fs.writeFileSync(path_, Buffer.from(data));
+    writeFileAtomic(path_, Buffer.from(data));
     db.close();
 
     return {
@@ -1563,24 +2086,42 @@ export async function loadEmbeddingModel(options?: {
     }
 
     if (pipelineFn && transformersSource) {
-      if (verbose) {
-        console.log(`Loading ONNX embedding model via ${transformersSource} (all-MiniLM-L6-v2)...`);
+      // #2461: pipelineFn() can throw with `fetch failed` on Windows behind
+      // a corporate proxy / strict firewall when transformers tries to pull
+      // the model files from the HuggingFace CDN. Without the catch, that
+      // throw escapes the outer try and aborts loadEmbeddingModel() with
+      // success=false BEFORE we reach the (working) ruvector ONNX fallback
+      // below — leaving embeddingModelState=null, which then crashes
+      // generateLocalEmbedding() with "Cannot read properties of null
+      // (reading 'model')" on every memory store / search call.
+      try {
+        if (verbose) {
+          console.log(`Loading ONNX embedding model via ${transformersSource} (all-MiniLM-L6-v2)...`);
+        }
+        const embedder = await pipelineFn('feature-extraction', 'Xenova/all-MiniLM-L6-v2');
+
+        embeddingModelState = {
+          loaded: true,
+          model: embedder,
+          tokenizer: null,
+          dimensions: 384 // MiniLM-L6 produces 384-dim vectors
+        };
+
+        return {
+          success: true,
+          dimensions: 384,
+          modelName: 'Xenova/all-MiniLM-L6-v2',
+          loadTime: Date.now() - startTime
+        };
+      } catch (err) {
+        if (verbose) {
+          console.warn(
+            `${transformersSource} pipeline init failed (${err instanceof Error ? err.message : String(err)}); ` +
+            'falling through to ruvector ONNX / agentic-flow / hash fallback.'
+          );
+        }
+        // Intentional fall-through to the next embedder branch.
       }
-      const embedder = await pipelineFn('feature-extraction', 'Xenova/all-MiniLM-L6-v2');
-
-      embeddingModelState = {
-        loaded: true,
-        model: embedder,
-        tokenizer: null,
-        dimensions: 384 // MiniLM-L6 produces 384-dim vectors
-      };
-
-      return {
-        success: true,
-        dimensions: 384,
-        modelName: 'Xenova/all-MiniLM-L6-v2',
-        loadTime: Date.now() - startTime
-      };
     }
 
     // Fallback: Check for agentic-flow ReasoningBank embeddings (v3)
@@ -1694,25 +2235,77 @@ export async function loadEmbeddingModel(options?: {
 /**
  * Generate real embedding for text
  * Uses ONNX model if available, falls back to deterministic hash
+ *
+ * AUDIT #3: the `backend` field is the authoritative signal for whether the
+ * returned vector carries real ONNX semantics ('onnx') or the deterministic
+ * hash fallback ('mock'). The hash fallback produces inverted/meaningless
+ * semantics, so operators MUST be able to tell the two apart even when the
+ * `model` string reports a real model name (e.g. the AgentDB bridge always
+ * labels its output 'Xenova/all-MiniLM-L6-v2' regardless of whether AgentDB's
+ * own embedder is real or stubbed). Set `backend` truthfully by the path that
+ * actually produced the vector. Do NOT change the embedding math.
  */
 export async function generateEmbedding(text: string): Promise<{
   embedding: number[];
   dimensions: number;
   model: string;
+  backend: 'onnx' | 'mock';
 }> {
   // ADR-053: Try AgentDB v3 bridge first
   const bridge = await getBridge();
   if (bridge) {
     const bridgeResult = await bridge.bridgeGenerateEmbedding(text);
-    if (bridgeResult) return bridgeResult;
+    if (bridgeResult) {
+      // The bridge labels its output with a real model name unconditionally;
+      // honor the backend it reports if present, otherwise treat a real model
+      // name as ONNX (the bridge only returns when AgentDB's embedder exists).
+      const backend: 'onnx' | 'mock' =
+        (bridgeResult as { backend?: 'onnx' | 'mock' }).backend ?? 'onnx';
+      return { ...bridgeResult, backend };
+    }
   }
 
+  return generateLocalEmbedding(text);
+}
+
+/**
+ * Generate an embedding using ONLY the local model chain (transformers.js /
+ * ruvector ONNX / hash fallback) — never the AgentDB bridge.
+ *
+ * #2312: this MUST stay bridge-free. `memory-bridge.ts` rescues a degraded
+ * agentdb embedder by delegating to this module; if that delegation went
+ * through `generateEmbedding` (bridge-first), the call would re-enter the
+ * patched `agentdb.embedder.embed` and recurse unboundedly:
+ *
+ *   generateEmbedding → bridgeGenerateEmbedding → embedder.embed (patched)
+ *     → generateEmbedding → … (heap OOM at ~4 GB on CI, no stack overflow
+ *     because the cycle is async/microtask-driven)
+ *
+ * Keeping the local chain as its own export breaks that cycle structurally.
+ */
+export async function generateLocalEmbedding(text: string): Promise<{
+  embedding: number[];
+  dimensions: number;
+  model: string;
+  backend: 'onnx' | 'mock';
+}> {
   // Ensure model is loaded
   if (!embeddingModelState?.loaded) {
     await loadEmbeddingModel();
   }
 
-  const state = embeddingModelState!;
+  // #2461: loadEmbeddingModel() can leave embeddingModelState null when an
+  // earlier loader (transformers fetch, ruvector init) throws and we never
+  // reach the hash-fallback assignment. Don't lie with a `!` non-null
+  // assertion — fall back to a synthetic hash-fallback state so we degrade
+  // to the deterministic 128-dim hash embedding instead of crashing the
+  // entire memory store/search path with "reading property 'model' of null".
+  const state = embeddingModelState ?? {
+    loaded: true,
+    model: null,
+    tokenizer: null,
+    dimensions: 128,
+  };
 
   // Use ONNX model if available
   if (state.model && typeof (state.model as any) === 'function') {
@@ -1726,7 +2319,8 @@ export async function generateEmbedding(text: string): Promise<{
         return {
           embedding,
           dimensions: embedding.length,
-          model: 'onnx'
+          model: 'onnx',
+          backend: 'onnx'
         };
       }
     } catch {
@@ -1734,12 +2328,15 @@ export async function generateEmbedding(text: string): Promise<{
     }
   }
 
-  // Deterministic hash-based fallback (for testing/demo without ONNX)
+  // Deterministic hash-based fallback (for testing/demo without ONNX).
+  // AUDIT #3: backend='mock' — these vectors do NOT carry real semantics.
+  (await import('./embedding-policy.js')).enforceNoStub('memory-initializer.generateLocalEmbedding'); // "no stubs" strict mode
   const embedding = generateHashEmbedding(text, state.dimensions);
   return {
     embedding,
     dimensions: state.dimensions,
-    model: 'hash-fallback'
+    model: 'hash-fallback',
+    backend: 'mock'
   };
 }
 
@@ -2008,12 +2605,11 @@ export async function verifyMemoryInit(dbPath: string, options?: {
       });
     }
 
-    // Cleanup test entry
-    db.run(`DELETE FROM memory_entries WHERE id = ?`, [testId]);
-
-    // Save changes
-    const data = db.export();
-    writeFileRestricted(dbPath, Buffer.from(data), { encrypt: true });
+    // Verification is read-only: sql.js holds an in-memory copy; discarding it on
+    // close() leaves the on-disk DB untouched. Writing back here would race the
+    // still-open better-sqlite3 handle (WAL) owned by ControllerRegistry /
+    // repairVectorIndexes — atomic rename fails with EPERM on Windows (#2596)
+    // and risks clobbering concurrent writes on all platforms.
     db.close();
 
     const passed = tests.filter(t => t.passed).length;
@@ -2091,12 +2687,29 @@ export async function storeEntry(options: {
     upsert = false
   } = options;
 
-  const swarmDir = path.resolve(process.cwd(), '.swarm');
+  const swarmDir = getMemoryRoot();
   const dbPath = customPath ? path.resolve(customPath) : path.join(swarmDir, 'memory.db');
 
   try {
     if (!fs.existsSync(dbPath)) {
       return { success: false, id: '', error: 'Database not initialized. Run: claude-flow memory init' };
+    }
+
+    // #2735 — refuse an unsafe whole-image write while a native WAL
+    // connection appears to be attached (sidecars on disk). See
+    // hasNativeWalSidecars()'s doc comment for the corruption mechanism
+    // this closes and its known residual (the narrow assess-then-write
+    // race). This check gates ensureSchemaColumns()'s own whole-image
+    // write below too, not just this function's.
+    if (hasNativeWalSidecars(dbPath)) {
+      return {
+        success: false,
+        id: '',
+        error: 'memory database has an active native WAL connection ' +
+          '(found -wal/-shm sidecar files) — refusing an unsafe sql.js ' +
+          'whole-image write. Retry once the native writer completes, or ' +
+          'restore the native better-sqlite3 bridge.',
+      };
     }
 
     // Ensure schema has all required columns (migration for older DBs)
@@ -2122,6 +2735,18 @@ export async function storeEntry(options: {
       embeddingDimensions = embResult.dimensions;
       embeddingModel = embResult.model;
     }
+
+    // #1941: provision a `vector_indexes` row for this namespace before the
+    // entry insert. The HNSW lookup uses this table to find which namespaces
+    // are indexed — without a row, `memory_search({namespace:"X"})` returns
+    // 0 even when memory_entries holds matching rows. INSERT OR IGNORE
+    // preserves the existing `default` / `patterns` rows.
+    try {
+      db.run(
+        `INSERT OR IGNORE INTO vector_indexes (id, name, dimensions) VALUES (?, ?, ?)`,
+        [namespace, namespace, embeddingDimensions ?? 384]
+      );
+    } catch { /* vector_indexes may not exist on legacy DBs — fall through */ }
 
     // Insert or update entry (upsert mode uses REPLACE)
     const insertSql = upsert
@@ -2220,7 +2845,7 @@ export async function searchEntries(options: {
   } = options;
   const effectiveNamespace = namespace || 'all';
 
-  const swarmDir = path.resolve(process.cwd(), '.swarm');
+  const swarmDir = getMemoryRoot();
   const dbPath = customPath ? path.resolve(customPath) : path.join(swarmDir, 'memory.db');
   const startTime = Date.now();
 
@@ -2407,6 +3032,8 @@ export async function listEntries(options: {
   limit?: number;
   offset?: number;
   dbPath?: string;
+  /** #2073: When true, include the entry's full `content` string in each result. */
+  includeContent?: boolean;
 }): Promise<{
   success: boolean;
   entries: {
@@ -2418,6 +3045,8 @@ export async function listEntries(options: {
     createdAt: string;
     updatedAt: string;
     hasEmbedding: boolean;
+    /** #2073: Present when `includeContent: true` was requested. */
+    content?: string;
   }[];
   total: number;
   error?: string;
@@ -2437,7 +3066,7 @@ export async function listEntries(options: {
     dbPath: customPath
   } = options;
 
-  const swarmDir = path.join(process.cwd(), '.swarm');
+  const swarmDir = getMemoryRoot();
   const dbPath = customPath || path.join(swarmDir, 'memory.db');
 
   try {
@@ -2454,10 +3083,13 @@ export async function listEntries(options: {
     const fileBuffer = readFileMaybeEncrypted(dbPath, null);
     const db = new SQL.Database(fileBuffer);
 
+    // #2120 — accept `status IS NULL` alongside `'active'`. Old DBs
+    // that predate the status column may have NULL after migration.
+    // See memory-bridge.ts:bridgeListEntries for full context.
     // Get total count
     const countStmt = namespace
-      ? db.prepare(`SELECT COUNT(*) as cnt FROM memory_entries WHERE status = 'active' AND namespace = ?`)
-      : db.prepare(`SELECT COUNT(*) as cnt FROM memory_entries WHERE status = 'active'`);
+      ? db.prepare(`SELECT COUNT(*) as cnt FROM memory_entries WHERE (status = 'active' OR status IS NULL) AND namespace = ?`)
+      : db.prepare(`SELECT COUNT(*) as cnt FROM memory_entries WHERE (status = 'active' OR status IS NULL)`);
     if (namespace) {
       countStmt.bind([namespace]);
     }
@@ -2472,9 +3104,10 @@ export async function listEntries(options: {
     // Get entries
     const safeLimit = parseInt(String(limit), 10) || 100;
     const safeOffset = parseInt(String(offset), 10) || 0;
+    // #2120 — same NULL-as-active acceptance as the count above.
     const listStmt = namespace
-      ? db.prepare(`SELECT id, key, namespace, content, embedding, access_count, created_at, updated_at FROM memory_entries WHERE status = 'active' AND namespace = ? ORDER BY updated_at DESC LIMIT ? OFFSET ?`)
-      : db.prepare(`SELECT id, key, namespace, content, embedding, access_count, created_at, updated_at FROM memory_entries WHERE status = 'active' ORDER BY updated_at DESC LIMIT ? OFFSET ?`);
+      ? db.prepare(`SELECT id, key, namespace, content, embedding, access_count, created_at, updated_at FROM memory_entries WHERE (status = 'active' OR status IS NULL) AND namespace = ? ORDER BY updated_at DESC LIMIT ? OFFSET ?`)
+      : db.prepare(`SELECT id, key, namespace, content, embedding, access_count, created_at, updated_at FROM memory_entries WHERE (status = 'active' OR status IS NULL) ORDER BY updated_at DESC LIMIT ? OFFSET ?`);
     if (namespace) {
       listStmt.bind([namespace, safeLimit, safeOffset]);
     } else {
@@ -2495,6 +3128,7 @@ export async function listEntries(options: {
       createdAt: string;
       updatedAt: string;
       hasEmbedding: boolean;
+      content?: string;
     }[] = [];
 
     if (result[0]?.values) {
@@ -2502,8 +3136,20 @@ export async function listEntries(options: {
         const [id, key, ns, content, embedding, accessCount, createdAt, updatedAt] = row as [
           string, string, string, string, string | null, number, string, string
         ];
-        entries.push({
-          id: String(id).substring(0, 20),
+        const entry: {
+          id: string;
+          key: string;
+          namespace: string;
+          size: number;
+          accessCount: number;
+          createdAt: string;
+          updatedAt: string;
+          hasEmbedding: boolean;
+          content?: string;
+        } = {
+          // #2073: don't truncate id when content is requested — callers
+          // (notably memory_export) need the full id to round-trip via import.
+          id: options.includeContent ? String(id) : String(id).substring(0, 20),
           key: key || String(id).substring(0, 15),
           namespace: ns || 'default',
           size: (content || '').length,
@@ -2511,7 +3157,11 @@ export async function listEntries(options: {
           createdAt: createdAt || new Date().toISOString(),
           updatedAt: updatedAt || new Date().toISOString(),
           hasEmbedding: !!embedding && embedding.length > 10
-        });
+        };
+        if (options.includeContent) {
+          entry.content = content || '';
+        }
+        entries.push(entry);
       }
     }
 
@@ -2565,12 +3215,27 @@ export async function getEntry(options: {
     dbPath: customPath
   } = options;
 
-  const swarmDir = path.join(process.cwd(), '.swarm');
+  const swarmDir = getMemoryRoot();
   const dbPath = customPath || path.join(swarmDir, 'memory.db');
 
   try {
     if (!fs.existsSync(dbPath)) {
       return { success: false, found: false, error: 'Database not found' };
+    }
+
+    // #2735 — see storeEntry's identical gate for the corruption mechanism
+    // this closes. Applies here too because the fallback's access_count
+    // bump is itself a whole-image write, not a lightweight read, even
+    // though this function's contract reads as a "get".
+    if (hasNativeWalSidecars(dbPath)) {
+      return {
+        success: false,
+        found: false,
+        error: 'memory database has an active native WAL connection ' +
+          '(found -wal/-shm sidecar files) — refusing an unsafe sql.js ' +
+          'whole-image read/write. Retry once the native writer completes, ' +
+          'or restore the native better-sqlite3 bridge.',
+      };
     }
 
     // Ensure schema has all required columns (migration for older DBs)
@@ -2699,7 +3364,7 @@ export async function deleteEntry(options: {
     dbPath: customPath
   } = options;
 
-  const swarmDir = path.join(process.cwd(), '.swarm');
+  const swarmDir = getMemoryRoot();
   const dbPath = customPath || path.join(swarmDir, 'memory.db');
 
   try {
@@ -2711,6 +3376,22 @@ export async function deleteEntry(options: {
         namespace,
         remainingEntries: 0,
         error: 'Database not found'
+      };
+    }
+
+    // #2735 — see storeEntry's identical gate for the corruption mechanism
+    // this closes.
+    if (hasNativeWalSidecars(dbPath)) {
+      return {
+        success: false,
+        deleted: false,
+        key,
+        namespace,
+        remainingEntries: 0,
+        error: 'memory database has an active native WAL connection ' +
+          '(found -wal/-shm sidecar files) — refusing an unsafe sql.js ' +
+          'whole-image write. Retry once the native writer completes, or ' +
+          'restore the native better-sqlite3 bridge.',
       };
     }
 
@@ -2810,6 +3491,153 @@ export async function deleteEntry(options: {
   }
 }
 
+// #2666 — Namespace reconciliation ("reaping"). `deleteEntry` above only ever
+// soft-deletes (UPDATE ... SET status='deleted'), and the row's (namespace,
+// key) stays occupied against the UNIQUE(namespace, key) constraint — a
+// caller that needs a namespace to be genuinely empty (e.g. a plugin
+// rebuilding its whole index after a source file was deleted, so a stale
+// row would otherwise survive forever with no dangling-ref/cycle signal to
+// ever catch it) has no way to get there through the public CLI/MCP surface.
+// `purgeNamespace` is a real `DELETE FROM memory_entries WHERE namespace = ?`
+// — irreversible, namespace-scoped, and lock-protected against a second
+// concurrent purge/delete on the same db file (see withMemoryDbLock below).
+//
+// This does NOT fully close #2621 (a concurrent daemon/MCP server already
+// mid read-modify-write on the sql.js fallback path can still flush an
+// older in-memory image after this purge commits, resurrecting rows) — that
+// requires every memory.db writer to respect the same lock, which is a
+// larger change than this namespace-reconcile primitive. The lock here
+// bounds the race to "another purge/delete running at the same instant",
+// which is the concrete case this feature needs to be safe against.
+
+const MEMORY_DB_LOCK_STALE_MS = 10_000;
+
+function delayMs(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+/**
+ * Advisory O_EXCL lock scoped to a single memory.db file (`<dbPath>.lock`),
+ * same stale-takeover pattern as services/global-ai-budget.ts. Only
+ * meaningful between callers that opt into it (purgeNamespace does); it
+ * cannot coordinate against writers that don't call this helper.
+ */
+export async function withMemoryDbLock<T>(dbPath: string, fn: () => Promise<T> | T): Promise<T> {
+  const lockFile = `${dbPath}.lock`;
+  const deadline = Date.now() + 5000;
+  for (;;) {
+    try {
+      const fd = fs.openSync(lockFile, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
+      fs.writeSync(fd, String(process.pid));
+      fs.closeSync(fd);
+      try {
+        return await fn();
+      } finally {
+        try { fs.unlinkSync(lockFile); } catch { /* already gone */ }
+      }
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e;
+      try {
+        const st = fs.lstatSync(lockFile);
+        if (Date.now() - st.mtimeMs > MEMORY_DB_LOCK_STALE_MS) {
+          fs.unlinkSync(lockFile);
+          continue;
+        }
+      } catch { /* raced — retry */ }
+      if (Date.now() > deadline) {
+        throw new Error(`timed out acquiring memory.db lock: ${lockFile}`);
+      }
+      await delayMs(25);
+    }
+  }
+}
+
+const NAMESPACE_PATTERN = /^[A-Za-z0-9._-]{1,128}$/;
+
+export async function purgeNamespace(options: {
+  namespace: string;
+  dbPath?: string;
+}): Promise<{
+  success: boolean;
+  deletedCount: number;
+  remainingEntries: number;
+  error?: string;
+}> {
+  const { namespace, dbPath: customPath } = options;
+
+  if (!NAMESPACE_PATTERN.test(namespace)) {
+    return { success: false, deletedCount: 0, remainingEntries: 0, error: `Invalid namespace: ${namespace}` };
+  }
+
+  const swarmDir = getMemoryRoot();
+  const dbPath = customPath ? path.resolve(customPath) : path.join(swarmDir, 'memory.db');
+
+  return withMemoryDbLock(dbPath, async () => {
+    // ADR-053: try the AgentDB v3 bridge first — a real SQLite handle, so
+    // the DELETE is a genuine transactional statement, not a whole-file
+    // read/mutate/rewrite.
+    const bridge = await getBridge();
+    if (bridge) {
+      const bridgeResult = await bridge.bridgePurgeNamespace({ namespace, dbPath });
+      if (bridgeResult) {
+        if (bridgeResult.deletedCount > 0 && hnswIndex?.entries) {
+          for (const [id, entry] of hnswIndex.entries) {
+            if (((entry as any)?.namespace ?? 'default') === namespace) hnswIndex.entries.delete(id);
+          }
+          saveHNSWMetadata();
+          rebuildSearchIndex();
+        }
+        return bridgeResult;
+      }
+    }
+
+    // Fallback: raw sql.js, same whole-file read/mutate/rewrite shape as
+    // deleteEntry's fallback path above (and the same encryption handling).
+    try {
+      if (!fs.existsSync(dbPath)) {
+        return { success: false, deletedCount: 0, remainingEntries: 0, error: 'Database not found' };
+      }
+
+      await ensureSchemaColumns(dbPath);
+
+      const initSqlJs = (await import('sql.js')).default;
+      const SQL = await initSqlJs();
+
+      const fileBuffer = readFileMaybeEncrypted(dbPath, null);
+      const db = new SQL.Database(fileBuffer);
+
+      const beforeResult = db.exec(`SELECT COUNT(*) FROM memory_entries WHERE namespace = ?`, [namespace]);
+      const deletedCount = (beforeResult[0]?.values?.[0]?.[0] as number) || 0;
+
+      db.run(`DELETE FROM memory_entries WHERE namespace = ?`, [namespace]);
+
+      const countResult = db.exec(`SELECT COUNT(*) FROM memory_entries WHERE status = 'active'`);
+      const remainingEntries = (countResult[0]?.values?.[0]?.[0] as number) || 0;
+
+      const data = db.export();
+      writeFileRestricted(dbPath, Buffer.from(data), { encrypt: true });
+      db.close();
+
+      if (deletedCount > 0 && hnswIndex?.entries) {
+        for (const [id, entry] of hnswIndex.entries) {
+          if (((entry as any)?.namespace ?? 'default') === namespace) hnswIndex.entries.delete(id);
+        }
+        saveHNSWMetadata();
+        rebuildSearchIndex();
+      }
+
+      return { success: true, deletedCount, remainingEntries };
+    } catch (error) {
+      return {
+        success: false,
+        deletedCount: 0,
+        remainingEntries: 0,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+  });
+}
+
 export default {
   initializeMemoryDatabase,
   checkMemoryInitialization,
@@ -2824,6 +3652,8 @@ export default {
   listEntries,
   getEntry,
   deleteEntry,
+  purgeNamespace,
+  withMemoryDbLock,
   rebuildSearchIndex,
   MEMORY_SCHEMA_V3,
   getInitialMetadata
